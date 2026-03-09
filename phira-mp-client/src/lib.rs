@@ -1,3 +1,5 @@
+mod srv_resolver;
+
 use anyhow::{Context, Error, Result};
 use dashmap::DashMap;
 use phira_mp_common::{
@@ -165,6 +167,12 @@ impl Client {
             ping_fail_count,
             ping_task_handle,
         })
+    }
+
+    pub async fn from_address(addr: &str) -> Result<Self> {
+        let resolved_addr = srv_resolver::resolve_server_address(addr).await?;
+        let stream = TcpStream::connect(resolved_addr).await?;
+        Self::new(stream).await
     }
 
     pub fn me(&self) -> Option<UserInfo> {
