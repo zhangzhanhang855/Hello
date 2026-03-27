@@ -1,71 +1,195 @@
-name: release
+name: Build executables and Docker images
+
 on:
   push:
-    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  BIN_NAME: phira-mp-server
+  PROJECT_NAME: phira-mp-server
+  IMAGE_NAME: ${{ github.repository_owner }}/phira-mp-server
+  CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runs-on: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runs-on: ubuntu-24.04-arm
+
+          # cross is trying to build amd64 image on arm runner!
+          # so i'm using x86 runner
+          - target: x86_64-unknown-linux-musl
+            runs-on: ubuntu-latest
+            cross-needed: true
+          - target: aarch64-unknown-linux-musl
+            runs-on: ubuntu-latest
+            cross-needed: true
+
+          # use cross build android binaries is more convenient
+          - target: aarch64-linux-android
+            runs-on: ubuntu-latest
+            cross-needed: true
+          - target: x86_64-linux-android
+            runs-on: ubuntu-latest
+            cross-needed: true
+
+          - target: aarch64-apple-darwin
+            runs-on: macos-latest
+          - target: x86_64-apple-darwin
+            runs-on: macos-15-intel
+
+          - target: x86_64-pc-windows-msvc
+            runs-on: windows-latest
+          - target: aarch64-pc-windows-msvc
+            runs-on: windows-11-arm
+
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runs-on }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v6
 
-      - name: Write Cross.toml
+      - name: Install cross if needed
+        if: matrix.cross-needed == true
         run: |
-          cat > Cross.toml <<'EOF'
-          [target.x86_64-unknown-linux-gnu]
-          pre-build = [
-              "dpkg --add-architecture $CROSS_DEB_ARCH",
-              "apt-get update && apt-get install --assume-yes pkg-config libssl-dev:$CROSS_DEB_ARCH"
-          ]
-          [target.aarch64-unknown-linux-gnu]
-          pre-build = [
-              "dpkg --add-architecture $CROSS_DEB_ARCH",
-              "apt-get update && apt-get install --assume-yes pkg-config libssl-dev:$CROSS_DEB_ARCH"
-          ]
-          EOF
+          cargo install cross --git https://github.com/cross-rs/cross
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Add rustup target (No cross)
+        if: matrix.cross-needed != true
+        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
 
-      - name: Install cross
-        run: cargo install cross --version 0.2.5
+      - name: Build binary
+        run: >
+          ${{ matrix.cross-needed == true && 'cross' || 'cargo' }}
+          build --target ${{ matrix.target }} --release --workspace
 
-      - name: Build ${{ matrix.target }}
-        run: cross build --release --workspace --target ${{ matrix.target }}
-
-      - name: Package binary
-        run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/phira-mp-server dist/phira-mp-server-${{ matrix.target }}
-          tar -czf dist/phira-mp-server-${{ matrix.target }}.tar.gz -C dist phira-mp-server-${{ matrix.target }}
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: binaries-${{ matrix.target }}
-          path: dist/phira-mp-server-${{ matrix.target }}.tar.gz
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          path: ./target/${{ matrix.target }}/release/${{ env.BIN_NAME }}${{ runner.os == 'Windows' && '.exe' || '' }}
 
-  publish:
+  image:
+    name: Build images
     needs: build
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
         with:
-          pattern: binaries-*
-          merge-multiple: true
-          path: dist
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create staging directory for binaries
+        run: mkdir -p amd64 arm64
+
+      - name: Download x86_64-unknown-linux-musl artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.BIN_NAME }}-x86_64-unknown-linux-musl
+          path: amd64
+
+      - name: Download aarch64-unknown-linux-musl artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.BIN_NAME }}-aarch64-unknown-linux-musl
+          path: arm64
+
+      - name: Make binaries executable
+        run: |
+          chmod +x amd64/${{ env.BIN_NAME }}
+          chmod +x arm64/${{ env.BIN_NAME }}
+
+      - name: Write Dockerfile
+        run: |
+          cat << EOF > Dockerfile
+          FROM alpine:3
+          ARG TARGETARCH
+          WORKDIR /app
+          COPY \${TARGETARCH}/${{ env.BIN_NAME }} .
+          EXPOSE 12346
+          ENTRYPOINT ["./${{ env.BIN_NAME }}"]
+          EOF
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=ref,event=tag
+
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sign the published Docker image
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: '*'
+          path: artifacts
+
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          for d in artifacts/*/; do
+            name=$(basename "$d")
+            (cd "$d" && zip -r "../../dist/$name.zip" .)
+          done
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           draft: false
-          files: dist/*.tar.gz
+          files: dist/*
